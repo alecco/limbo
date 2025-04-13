@@ -73,9 +73,7 @@ impl DumbLruPageCache {
         self.touch(ptr);
 
         self.map.borrow_mut().insert(key, ptr);
-        if self.len() > self.capacity {
-            self.pop_if_not_dirty();
-        }
+        self.evict();
     }
 
     pub fn delete(&mut self, key: PageCacheKey) {
@@ -177,20 +175,44 @@ impl DumbLruPageCache {
         self.head.borrow_mut().replace(entry);
     }
 
-    fn pop_if_not_dirty(&mut self) {
-        let tail = *self.tail.borrow();
-        if tail.is_none() {
+    fn evict(&mut self) {
+        if self.len() <= self.capacity {
             return;
         }
-        let mut tail = tail.unwrap();
-        let tail_entry = unsafe { tail.as_mut() };
-        if tail_entry.page.is_dirty() {
-            // TODO: drop from another clean entry?
-            return;
+
+        let mut current = match *self.tail.borrow() {
+            Some(tail) => tail,
+            None => {
+                debug!("evict() nothing at tail");
+                return;
+            }
+        };
+
+        while self.len() > self.capacity {
+            let current_entry = unsafe { current.as_mut() };
+
+            if current_entry.page.is_dirty() {
+                match current_entry.prev {
+                    Some(prev) => current = prev,
+                    None => {
+                        debug!("evict() no clean pages available");
+                        return;
+                    }
+                }
+                continue;
+            }
+
+            debug!("evict(key={:?})", current_entry.key);
+
+            let prev = current_entry.prev;
+            let key_to_remove = current_entry.key.clone();
+            self.detach(current, true);
+            assert!(self.map.borrow_mut().remove(&key_to_remove).is_some());
+            if prev.is_none() {
+                break;
+            }
+            current = prev.unwrap();
         }
-        tracing::debug!("pop_if_not_dirty(key={:?})", tail_entry.key);
-        self.detach(tail, true);
-        assert!(self.map.borrow_mut().remove(&tail_entry.key).is_some());
     }
 
     pub fn clear(&mut self) {
