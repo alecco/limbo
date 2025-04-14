@@ -1,5 +1,6 @@
 use std::{cell::RefCell, collections::HashMap, ptr::NonNull};
 
+use std::sync::Arc;
 use tracing::{debug, trace};
 
 use super::pager::PageRef;
@@ -120,13 +121,22 @@ impl DumbLruPageCache {
         todo!();
     }
 
-    fn detach(&mut self, mut entry: NonNull<PageCacheEntry>, clean_page: bool) {
-        if clean_page {
-            // evict buffer
-            let page = unsafe { &entry.as_mut().page };
-            page.clear_loaded();
-            debug!("cleaning up page {}", page.get().id);
-            let _ = page.get().contents.take();
+    fn detach(&mut self, mut entry: NonNull<PageCacheEntry>, clean_page: bool) -> bool {
+        let entry_mut = unsafe { entry.as_mut() };
+        if entry_mut.page.is_locked() || entry_mut.page.is_dirty() {
+            return false;
+        }
+
+        if let Some(page_mut) = Arc::get_mut(&mut entry_mut.page) {
+            if clean_page {
+                page_mut.clear_loaded();
+                debug!("cleaning up page {}", page_mut.get().id);
+                let _ = page_mut.get().contents.take();
+            }
+        } else {
+            let page_id = unsafe { &entry.as_mut().page.get().id };
+            debug!("detach page {}: other references", page_id);
+            return false;
         }
 
         let (next, prev) = unsafe {
@@ -159,6 +169,7 @@ impl DumbLruPageCache {
                 n_mut.prev = Some(p);
             },
         };
+        true
     }
 
     /// inserts into head, assuming we detached first
@@ -189,8 +200,9 @@ impl DumbLruPageCache {
             return;
         }
         tracing::debug!("pop_if_not_dirty(key={:?})", tail_entry.key);
-        self.detach(tail, true);
-        assert!(self.map.borrow_mut().remove(&tail_entry.key).is_some());
+        if self.detach(tail, true) {
+            assert!(self.map.borrow_mut().remove(&tail_entry.key).is_some());
+        }
     }
 
     pub fn clear(&mut self) {
