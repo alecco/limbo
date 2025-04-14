@@ -1,5 +1,6 @@
 use std::{cell::RefCell, collections::HashMap, ptr::NonNull};
 
+use std::sync::Arc;
 use tracing::{debug, trace};
 
 use super::pager::PageRef;
@@ -40,6 +41,13 @@ pub struct DumbLruPageCache {
 unsafe impl Send for DumbLruPageCache {}
 unsafe impl Sync for DumbLruPageCache {}
 
+#[derive(Debug, PartialEq)]
+pub enum CacheError {
+    PageLocked,
+    PageDirty,
+    PageHasActiveRefs,
+}
+
 impl PageCacheKey {
     pub fn new(pgno: usize, max_frame: Option<u64>) -> Self {
         Self { pgno, max_frame }
@@ -59,9 +67,13 @@ impl DumbLruPageCache {
         self.map.borrow().contains_key(key)
     }
 
-    pub fn insert(&mut self, key: PageCacheKey, value: PageRef) {
-        self._delete(key.clone(), false);
+    pub fn insert(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
         trace!("cache_insert(key={:?})", key);
+        self._delete(key.clone(), false)?;
+        if self.len() >= self.capacity {
+            // Make room before trying to insert
+            self.pop_if_not_dirty()?;
+        }
         let entry = Box::new(PageCacheEntry {
             key: key.clone(),
             next: None,
@@ -73,24 +85,26 @@ impl DumbLruPageCache {
         self.touch(ptr);
 
         self.map.borrow_mut().insert(key, ptr);
-        if self.len() > self.capacity {
-            self.pop_if_not_dirty();
-        }
+        Ok(())
     }
 
-    pub fn delete(&mut self, key: PageCacheKey) {
+    pub fn delete(&mut self, key: PageCacheKey) -> Result<(), CacheError> {
         trace!("cache_delete(key={:?})", key);
         self._delete(key, true)
     }
 
-    pub fn _delete(&mut self, key: PageCacheKey, clean_page: bool) {
-        let ptr = self.map.borrow_mut().remove(&key);
-        if ptr.is_none() {
-            return;
+    // Returns Ok if key is not found
+    pub fn _delete(&mut self, key: PageCacheKey, clean_page: bool) -> Result<(), CacheError> {
+        if !self.contains_key(&key) {
+            return Ok(());
         }
-        let ptr = ptr.unwrap();
-        self.detach(ptr, clean_page);
+
+        let ptr = *self.map.borrow().get(&key).unwrap();
+        // Try to detach from LRU list first, can fail
+        self.detach(ptr, clean_page)?;
+        let ptr = self.map.borrow_mut().remove(&key).unwrap();
         unsafe { std::ptr::drop_in_place(ptr.as_ptr()) };
+        Ok(())
     }
 
     fn get_ptr(&mut self, key: &PageCacheKey) -> Option<NonNull<PageCacheEntry>> {
@@ -120,15 +134,32 @@ impl DumbLruPageCache {
         todo!();
     }
 
-    fn detach(&mut self, mut entry: NonNull<PageCacheEntry>, clean_page: bool) {
-        if clean_page {
-            // evict buffer
-            let page = unsafe { &entry.as_mut().page };
-            page.clear_loaded();
-            debug!("cleaning up page {}", page.get().id);
-            let _ = page.get().contents.take();
+    fn detach(
+        &mut self,
+        mut entry: NonNull<PageCacheEntry>,
+        clean_page: bool,
+    ) -> Result<(), CacheError> {
+        let entry_mut = unsafe { entry.as_mut() };
+        if entry_mut.page.is_locked() {
+            return Err(CacheError::PageLocked);
+        }
+        if entry_mut.page.is_dirty() {
+            return Err(CacheError::PageDirty);
+        }
+
+        if let Some(page_mut) = Arc::get_mut(&mut entry_mut.page) {
+            if clean_page {
+                page_mut.clear_loaded();
+                debug!("cleaning up page {}", page_mut.get().id);
+                let _ = page_mut.get().contents.take();
+            }
+        } else {
+            let page_id = unsafe { &entry.as_mut().page.get().id };
+            debug!("detach page {}: other references", page_id);
+            return Err(CacheError::PageHasActiveRefs);
         }
         self.unlink(entry);
+        Ok(())
     }
 
     fn unlink(&mut self, mut entry: NonNull<PageCacheEntry>) {
@@ -179,27 +210,30 @@ impl DumbLruPageCache {
         self.head.borrow_mut().replace(entry);
     }
 
-    fn pop_if_not_dirty(&mut self) {
+    fn pop_if_not_dirty(&mut self) -> Result<(), CacheError> {
         let tail = *self.tail.borrow();
         if tail.is_none() {
-            return;
+            return Ok(());
         }
+
         let mut tail = tail.unwrap();
         let tail_entry = unsafe { tail.as_mut() };
-        if tail_entry.page.is_dirty() {
-            // TODO: drop from another clean entry?
-            return;
-        }
         tracing::debug!("pop_if_not_dirty(key={:?})", tail_entry.key);
-        self.detach(tail, true);
-        assert!(self.map.borrow_mut().remove(&tail_entry.key).is_some());
+        let key = tail_entry.key.clone();
+
+        // TODO: drop from another clean entry?
+        self.detach(tail, true)?;
+
+        assert!(self.map.borrow_mut().remove(&key).is_some());
+        Ok(())
     }
 
-    pub fn clear(&mut self) {
+    pub fn clear(&mut self) -> Result<(), CacheError> {
         let to_remove: Vec<PageCacheKey> = self.map.borrow().iter().map(|v| v.0.clone()).collect();
         for key in to_remove {
-            self.delete(key);
+            self.delete(key)?;
         }
+        Ok(())
     }
 
     pub fn print(&mut self) {
@@ -342,6 +376,7 @@ impl DumbLruPageCache {
 mod tests {
     use super::*;
     use crate::io::{Buffer, BufferData};
+    use crate::storage::page_cache::CacheError;
     use crate::storage::pager::{Page, PageRef};
     use crate::storage::sqlite3_ondisk::PageContent;
     use std::{cell::RefCell, num::NonZeroUsize, pin::Pin, rc::Rc, sync::Arc};
@@ -375,7 +410,7 @@ mod tests {
     fn insert_page(cache: &mut DumbLruPageCache, id: usize) -> PageCacheKey {
         let key = create_key(id);
         let page = page_with_content(id);
-        cache.insert(key.clone(), page);
+        assert!(cache.insert(key.clone(), page).is_ok());
         key
     }
 
@@ -393,7 +428,7 @@ mod tests {
         assert!(cache.tail.borrow().is_some());
         assert_eq!(*cache.head.borrow(), *cache.tail.borrow());
 
-        cache.delete(key1.clone());
+        assert!(cache.delete(key1.clone()).is_ok());
 
         assert_eq!(
             cache.len(),
@@ -425,7 +460,7 @@ mod tests {
             "Initial head check"
         );
 
-        cache.delete(key3.clone());
+        assert!(cache.delete(key3.clone()).is_ok());
 
         assert_eq!(cache.len(), 2, "Length should be 2 after deleting head");
         assert!(
@@ -469,7 +504,7 @@ mod tests {
             "Initial tail check"
         );
 
-        cache.delete(key1.clone()); // Delete tail
+        assert!(cache.delete(key1.clone()).is_ok()); // Delete tail
 
         assert_eq!(cache.len(), 2, "Length should be 2 after deleting tail");
         assert!(
@@ -520,7 +555,7 @@ mod tests {
         let head_ptr_before = cache.head.borrow().unwrap();
         let tail_ptr_before = cache.tail.borrow().unwrap();
 
-        cache.delete(key2.clone()); // Detach a middle element (key2)
+        assert!(cache.delete(key2.clone()).is_ok()); // Detach a middle element (key2)
 
         assert_eq!(cache.len(), 3, "Length should be 3 after deleting middle");
         assert!(
@@ -560,19 +595,19 @@ mod tests {
         let mut cache = DumbLruPageCache::new(5);
         let key1 = create_key(1);
         let page1 = page_with_content(1);
-        cache.insert(key1.clone(), page1.clone());
-        assert!(
-            page_has_content(&page1),
-            "Page content should exist before delete"
-        );
+        assert!(cache.insert(key1.clone(), page1.clone()).is_ok());
+        assert!(page_has_content(&page1));
         cache.verify_list_integrity();
 
-        cache.delete(key1.clone());
+        let result = cache.delete(key1.clone());
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), CacheError::PageHasActiveRefs);
+        assert_eq!(cache.len(), 1);
+
+        drop(page1);
+
+        assert!(cache.delete(key1).is_ok());
         assert_eq!(cache.len(), 0);
-        assert!(
-            !page_has_content(&page1),
-            "Page content should be removed after delete"
-        );
         cache.verify_list_integrity();
     }
 
@@ -583,28 +618,21 @@ mod tests {
         let page1_v1 = page_with_content(1);
         let page1_v2 = page_with_content(1);
 
-        cache.insert(key1.clone(), page1_v1.clone());
-        assert!(
-            page_has_content(&page1_v1),
-            "Page1 V1 content should exist initially"
-        );
+        assert!(cache.insert(key1.clone(), page1_v1.clone()).is_ok());
+        assert_eq!(cache.len(), 1);
         cache.verify_list_integrity();
 
-        cache.insert(key1.clone(), page1_v2.clone()); // Trigger delete page1_v1
+        // Fail to insert v2 as v1 is still referenced
+        let result = cache.insert(key1.clone(), page1_v2.clone());
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), CacheError::PageHasActiveRefs);
+        assert_eq!(cache.len(), 1); // Page v1 should remain in cache
+        assert!(page_has_content(&page1_v1));
 
-        assert_eq!(
-            cache.len(),
-            1,
-            "Cache length should still be 1 after replace"
-        );
-        assert!(
-            !page_has_content(&page1_v1),
-            "Page1 V1 content should be cleaned after being replaced in cache"
-        );
-        assert!(
-            page_has_content(&page1_v2),
-            "Page1 V2 content should exist after insert"
-        );
+        drop(page1_v1);
+        assert!(cache.insert(key1.clone(), page1_v2.clone()).is_ok());
+        assert_eq!(cache.len(), 1);
+        assert!(page_has_content(&page1_v2));
 
         let current_page = cache.get(&key1).unwrap();
         assert!(
@@ -653,9 +681,9 @@ mod tests {
                     let key = PageCacheKey::new(id_page as usize, Some(id_frame));
                     #[allow(clippy::arc_with_non_send_sync)]
                     let page = Arc::new(Page::new(id_page as usize));
+                    lru.push(key.clone(), page.clone());
                     // println!("inserting page {:?}", key);
-                    cache.insert(key.clone(), page.clone());
-                    lru.push(key, page);
+                    cache.insert(key.clone(), page); // move page so there's no reference left here
                     assert!(cache.len() <= 10);
                 }
                 1 => {
@@ -712,7 +740,7 @@ mod tests {
     fn test_page_cache_delete() {
         let mut cache = DumbLruPageCache::new(2);
         let key1 = insert_page(&mut cache, 1);
-        cache.delete(key1.clone());
+        assert!(cache.delete(key1.clone()).is_ok());
         assert!(cache.get(&key1).is_none());
     }
 
@@ -721,7 +749,7 @@ mod tests {
         let mut cache = DumbLruPageCache::new(2);
         let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
-        cache.clear();
+        assert!(cache.clear().is_ok());
         assert!(cache.get(&key1).is_none());
         assert!(cache.get(&key2).is_none());
     }
