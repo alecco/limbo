@@ -13,6 +13,12 @@ args = parser.parse_args()
 conn = sqlite3.connect(args.filename)
 cursor = conn.cursor()
 
+cursor.execute("PRAGMA journal_mode = OFF;")
+cursor.execute("PRAGMA synchronous = OFF;")
+cursor.execute("PRAGMA locking_mode = EXCLUSIVE;")
+cursor.execute("PRAGMA cache_size = 1000000;")
+cursor.execute("PRAGMA threads = 4;")
+
 # Create the user table
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS user (
