@@ -1,6 +1,5 @@
 #!/bin/bash
 
-for i in {0..99}
-do
-  ./gen-database.py "database$i.db" --count 10000
-done
+PARALLEL_JOBS=${1:-10}
+
+seq 0 99 | xargs -P $PARALLEL_JOBS -I{} ./gen-database.py "database{}.db" --count 10000
