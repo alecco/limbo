@@ -395,6 +395,41 @@ mod tests {
         page.is_loaded() && page.get().contents.is_some()
     }
 
+    #[derive(Clone, Copy)]
+    pub enum DirtyState {
+        Clean,
+        Dirty,
+    }
+
+    #[derive(Clone, Copy)]
+    pub enum LockState {
+        Unlocked,
+        Locked,
+    }
+
+    #[must_use]
+    fn insert_page_with_state(
+        cache: &mut DumbLruPageCache,
+        id: usize,
+        dirty: DirtyState,
+        lock: LockState,
+    ) -> PageCacheKey {
+        let key = create_key(id);
+        let page = page_with_content(id);
+
+        match dirty {
+            DirtyState::Dirty => page.set_dirty(),
+            DirtyState::Clean => (),
+        }
+
+        match lock {
+            LockState::Locked => page.set_locked(),
+            LockState::Unlocked => (),
+        }
+        cache.insert(key.clone(), page.clone());
+        key
+    }
+
     #[test]
     fn test_detach_only_element() {
         let mut cache = DumbLruPageCache::new(5);
@@ -745,5 +780,21 @@ mod tests {
             let key = insert_page(&mut cache, i);
             assert_eq!(cache.peek(&key, false).unwrap().get().id, i);
         }
+    }
+
+    #[test]
+    fn test_page_cache_no_evict_one_dirty() {
+        let mut cache = DumbLruPageCache::new(1);
+        let key1 = insert_page_with_state(&mut cache, 1, DirtyState::Dirty, LockState::Unlocked);
+        let _ = insert_page(&mut cache, 2); // fails to evict 1
+        assert!(cache.get(&key1).is_some());
+    }
+
+    #[test]
+    fn test_page_cache_no_evict_one_locked() {
+        let mut cache = DumbLruPageCache::new(1);
+        let key1 = insert_page_with_state(&mut cache, 1, DirtyState::Clean, LockState::Locked);
+        let _ = insert_page(&mut cache, 2); // fails to evict 1
+        assert!(cache.get(&key1).is_some());
     }
 }
