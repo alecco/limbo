@@ -109,7 +109,7 @@ impl DumbLruPageCache {
         let mut ptr = self.get_ptr(key)?;
         let page = unsafe { ptr.as_mut().page.clone() };
         if touch {
-            self.detach(ptr, false);
+            self._detach(ptr);
             self._insert_head(ptr);
         }
         Some(page)
@@ -128,7 +128,10 @@ impl DumbLruPageCache {
             debug!("cleaning up page {}", page.get().id);
             let _ = page.get().contents.take();
         }
+        self._detach(entry);
+    }
 
+    fn _detach(&mut self, mut entry: NonNull<PageCacheEntry>) {
         let (next, prev) = unsafe {
             let c = entry.as_mut();
             let next = c.next;
@@ -138,7 +141,6 @@ impl DumbLruPageCache {
             (next, prev)
         };
 
-        // detach
         match (prev, next) {
             (None, None) => {
                 self.head.replace(None);
