@@ -70,7 +70,7 @@ impl DumbLruPageCache {
         });
         let ptr_raw = Box::into_raw(entry);
         let ptr = unsafe { ptr_raw.as_mut().unwrap().as_non_null() };
-        self.touch(ptr);
+        self._insert_head(ptr);
 
         self.map.borrow_mut().insert(key, ptr);
         if self.len() > self.capacity {
@@ -110,7 +110,7 @@ impl DumbLruPageCache {
         let page = unsafe { ptr.as_mut().page.clone() };
         if touch {
             self.detach(ptr, false);
-            self.touch(ptr);
+            self._insert_head(ptr);
         }
         Some(page)
     }
@@ -162,7 +162,7 @@ impl DumbLruPageCache {
     }
 
     /// inserts into head, assuming we detached first
-    fn touch(&mut self, mut entry: NonNull<PageCacheEntry>) {
+    fn _insert_head(&mut self, mut entry: NonNull<PageCacheEntry>) {
         if let Some(mut head) = *self.head.borrow_mut() {
             unsafe {
                 entry.as_mut().next.replace(head);
