@@ -294,15 +294,18 @@ impl Pager {
         Ok(())
     }
 
+    fn _max_frame(&self) -> u64 {
+        match &self.wal {
+            Some(wal) => wal.borrow().get_max_frame(),
+            None => 0,
+        }
+    }
+
     /// Reads a page from the database.
     pub fn read_page(&self, page_idx: usize) -> Result<PageRef> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
-        let max_frame = match &self.wal {
-            Some(wal) => wal.borrow().get_max_frame(),
-            None => 0,
-        };
-        let page_key = PageCacheKey::new(page_idx, Some(max_frame));
+        let page_key = PageCacheKey::new(page_idx, Some(self._max_frame()));
         if let Some(page) = page_cache.get(&page_key) {
             tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
             return Ok(page.clone());
@@ -340,11 +343,7 @@ impl Pager {
         trace!("load_page(page_idx = {})", id);
         let mut page_cache = self.page_cache.write();
         page.set_locked();
-        let max_frame = match &self.wal {
-            Some(wal) => wal.borrow().get_max_frame(),
-            None => 0,
-        };
-        let page_key = PageCacheKey::new(id, Some(max_frame));
+        let page_key = PageCacheKey::new(id, Some(self._max_frame()));
         if let Some(wal) = &self.wal {
             if let Some(frame_id) = wal.borrow().find_frame(id as u64)? {
                 wal.borrow()
@@ -399,13 +398,9 @@ impl Pager {
             match state {
                 FlushState::Start => {
                     let db_size = self.db_header.lock().database_size;
-                    let max_frame = match &self.wal {
-                        Some(wal) => wal.borrow().get_max_frame(),
-                        None => 0,
-                    };
                     for page_id in self.dirty_pages.borrow().iter() {
                         let mut cache = self.page_cache.write();
-                        let page_key = PageCacheKey::new(*page_id, Some(max_frame));
+                        let page_key = PageCacheKey::new(*page_id, Some(self._max_frame()));
                         if let Some(wal) = &self.wal {
                             let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
                             let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
@@ -653,12 +648,8 @@ impl Pager {
             page.set_dirty();
             self.add_dirty(page.get().id);
             let mut cache = self.page_cache.write();
-            let max_frame = match &self.wal {
-                Some(wal) => wal.borrow().get_max_frame(),
-                None => 0,
-            };
 
-            let page_key = PageCacheKey::new(page.get().id, Some(max_frame));
+            let page_key = PageCacheKey::new(page.get().id, Some(self._max_frame()));
             cache.insert(page_key, page.clone());
         }
         Ok(page)
@@ -667,11 +658,7 @@ impl Pager {
     pub fn put_loaded_page(&self, id: usize, page: PageRef) {
         let mut cache = self.page_cache.write();
         // cache insert invalidates previous page
-        let max_frame = match &self.wal {
-            Some(wal) => wal.borrow().get_max_frame(),
-            None => 0,
-        };
-        let page_key = PageCacheKey::new(id, Some(max_frame));
+        let page_key = PageCacheKey::new(id, Some(self._max_frame()));
         cache.insert(page_key, page.clone());
         page.set_loaded();
     }
