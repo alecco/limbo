@@ -51,6 +51,14 @@ pub enum LimboError {
     IntegerOverflow,
     #[error("Schema is locked for write")]
     SchemaLocked,
+    #[error("Page is locked")]
+    PageLocked,
+    #[error("Page is dirty")]
+    PageDirty,
+    #[error("Page has multiple references")]
+    PageHasMultipleRefs,
+    #[error("Page cache is full")]
+    PageCacheFull,
 }
 
 #[macro_export]
@@ -71,6 +79,13 @@ macro_rules! bail_corrupt_error {
 macro_rules! bail_constraint_error {
     ($($arg:tt)*) => {
         return Err($crate::error::LimboError::Constraint(format!($($arg)*)))
+    };
+}
+
+#[macro_export]
+macro_rules! bail_page_error {
+    ($error:expr) => {
+        return Err($error)
     };
 }
 

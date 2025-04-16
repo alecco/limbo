@@ -1,6 +1,6 @@
-use std::{cell::RefCell, collections::HashMap, ptr::NonNull};
+use std::{cell::RefCell, collections::HashMap, ptr::NonNull, result::Result, sync::Arc};
+use crate::error::LimboError;
 
-use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
 use super::pager::PageRef;
@@ -60,36 +60,52 @@ impl DumbLruPageCache {
         self.map.borrow().contains_key(key)
     }
 
-    pub fn insert(&mut self, key: PageCacheKey, value: PageRef) {
-        self._delete(key.clone(), false);
+    #[must_use]
+    pub fn insert(&mut self, key: &PageCacheKey, value: PageRef) -> Result<(), LimboError> {
         trace!("cache_insert(key={:?})", key);
-        // TODO: fail to insert if couldn't make room for page
-        let _ = self.evict();
-        let entry = Box::new(PageCacheEntry {
-            key: key.clone(),
-            next: None,
-            prev: None,
-            page: value,
-        });
-        let ptr_raw = Box::into_raw(entry);
-        let ptr = unsafe { ptr_raw.as_mut().unwrap().as_non_null() };
-        self._insert_head(ptr);
+        let mut map = self.map.borrow_mut();
+        if let Some(ptr_ref_mut) = map.get_mut(key) {
+            trace!("cache_insert(key={:?}) replacing existing entry", key);
+            let entry_mut = unsafe { ptr_ref_mut.as_mut() };
+            // Clean the OLD page first
+            self.clean_page(&mut entry_mut.page)?; // ...or fail
+            entry_mut.page = value;
+            let ptr_copy = *ptr_ref_mut;
+            self._detach(ptr_ref_mut);
+            self._insert_head(&ptr_copy);
+        } else {
+            trace!("cache_insert(key={:?}) evicting some entry", key);
+            if !self.make_room_for_page() {
+                return Err(LimboError::PageCacheFull);
+            }
 
-        self.map.borrow_mut().insert(key, ptr);
+            let entry = Box::new(PageCacheEntry {
+                key: key.clone(),
+                next: None,
+                prev: None,
+                page: value,
+            });
+            let ptr_raw = Box::into_raw(entry);
+            let ptr = unsafe { ptr_raw.as_mut().unwrap().as_non_null() };
+            self._insert_head(&ptr);
+
+            map.insert(key.clone(), ptr);
+        }
+        Ok(())
     }
 
     pub fn delete(&mut self, key: PageCacheKey) {
         trace!("cache_delete(key={:?})", key);
-        self._delete(key, true)
+        self._delete(&key, true)
     }
 
-    pub fn _delete(&mut self, key: PageCacheKey, clean_page: bool) {
+    pub fn _delete(&mut self, key: &PageCacheKey, clean_page: bool) {
         let ptr = self.map.borrow_mut().remove(&key);
         if ptr.is_none() {
             return;
         }
         let ptr = ptr.unwrap();
-        self.detach(ptr, clean_page);
+        self.detach(&ptr, clean_page);
         unsafe { std::ptr::drop_in_place(ptr.as_ptr()) };
     }
 
@@ -109,8 +125,8 @@ impl DumbLruPageCache {
         let mut ptr = self.get_ptr(key)?;
         let page = unsafe { ptr.as_mut().page.clone() };
         if touch {
-            self._detach(ptr);
-            self._insert_head(ptr);
+            self._detach(&ptr);
+            self._insert_head(&ptr);
         }
         Some(page)
     }
@@ -120,28 +136,37 @@ impl DumbLruPageCache {
         todo!();
     }
 
-    fn detach(&mut self, mut entry: NonNull<PageCacheEntry>, clean_page: bool) -> bool {
-        let entry_mut = unsafe { entry.as_mut() };
-        if entry_mut.page.is_locked() || entry_mut.page.is_dirty() {
-            return false;
-        }
-
-        if let Some(page_mut) = Arc::get_mut(&mut entry_mut.page) {
-            if clean_page {
-                page_mut.clear_loaded();
-                debug!("cleaning up page {}", page_mut.get().id);
-                let _ = page_mut.get().contents.take();
-            }
+    fn clean_page(&mut self, page: &mut PageRef) -> Result<(), LimboError> {
+        if let Some(page_mut) = Arc::get_mut(page) {
+            page_mut.clear_loaded();
+            debug!("cleaning up page {}", page_mut.get().id);
+            let _ = page_mut.get().contents.take();
+            Ok(())
         } else {
-            let page_id = unsafe { &entry.as_mut().page.get().id };
-            debug!("detach page {}: other references", page_id);
-            return false;
+            Err(LimboError::PageHasMultipleRefs)
         }
-        self._detach(entry);
-        true
     }
 
-    fn _detach(&mut self, mut entry: NonNull<PageCacheEntry>) {
+    #[must_use]
+    fn detach(&mut self, entry: &mut NonNull<PageCacheEntry>, clean_page: bool) -> Result<(), LimboError> {
+        let entry_mut = unsafe { entry.as_mut() };
+        
+        if entry_mut.page.is_locked() {
+            return Err(LimboError::PageLocked);
+        }
+        if entry_mut.page.is_dirty() {
+            return Err(LimboError::PageDirty);
+        }
+
+        if clean_page {
+            self.clean_page(&mut entry_mut.page)?;
+        }
+
+        self._detach(entry);
+        Ok(())
+    }
+
+    fn _detach(&mut self, entry: &mut NonNull<PageCacheEntry>) {
         let (next, prev) = unsafe {
             let c = entry.as_mut();
             let next = c.next;
@@ -174,24 +199,24 @@ impl DumbLruPageCache {
     }
 
     /// inserts into head, assuming we detached first
-    fn _insert_head(&mut self, mut entry: NonNull<PageCacheEntry>) {
+    fn _insert_head(&mut self, mut entry: &NonNull<PageCacheEntry>) {
         if let Some(mut head) = *self.head.borrow_mut() {
             unsafe {
                 entry.as_mut().next.replace(head);
                 let head = head.as_mut();
-                head.prev = Some(entry);
+                head.prev = Some(*entry);
             }
         }
 
         if self.tail.borrow().is_none() {
-            self.tail.borrow_mut().replace(entry);
+            self.tail.borrow_mut().replace(*entry);
         }
-        self.head.borrow_mut().replace(entry);
+        self.head.borrow_mut().replace(*entry);
     }
 
     // Tries to evict pages until there's capacity for one more page
     #[must_use]
-    fn evict(&mut self) -> bool {
+    fn make_room_for_page(&mut self) -> bool {
         if self.len() < self.capacity {
             return true;
         }
@@ -199,7 +224,7 @@ impl DumbLruPageCache {
         let mut current = match *self.tail.borrow() {
             Some(tail) => tail,
             None => {
-                debug!("evict() nothing at tail");
+                debug!("make_room_for_page() nothing at tail");
                 return false;
             }
         };
@@ -211,19 +236,19 @@ impl DumbLruPageCache {
                 match current_entry.prev {
                     Some(prev) => current = prev,
                     None => {
-                        debug!("evict() not enough clean and unlocked pages to evict");
+                        debug!("make_room_for_page() not enough clean and unlocked pages to evict");
                         return false;
                     }
                 }
                 continue;
             }
 
-            debug!("evict(key={:?})", current_entry.key);
+            debug!("make_room_for_page(key={:?})", current_entry.key);
 
             let prev = current_entry.prev;
             let key_to_remove = current_entry.key.clone();
             if !self.detach(current, true) {
-                warn!("evict(key={:?}) failed to detach", current_entry.key);
+                warn!("make_room_for_page(key={:?}) failed to detach", current_entry.key);
                 break;
             }
             assert!(self.map.borrow_mut().remove(&key_to_remove).is_some());
@@ -813,7 +838,7 @@ mod tests {
     fn test_page_cache_no_evict_dirty() {
         let mut cache = DumbLruPageCache::new(1);
         let _ = insert_page_with_state(&mut cache, 1, DirtyState::Dirty, LockState::Unlocked);
-        assert!(cache.evict() == false);
+        assert!(cache.make_room_for_page() == false);
         assert!(cache.len() == 1);
     }
 
@@ -821,7 +846,7 @@ mod tests {
     fn test_page_cache_no_evict_locked() {
         let mut cache = DumbLruPageCache::new(1);
         let _ = insert_page_with_state(&mut cache, 1, DirtyState::Clean, LockState::Locked);
-        assert!(cache.evict() == false);
+        assert!(cache.make_room_for_page() == false);
         assert!(cache.len() == 1);
     }
 
