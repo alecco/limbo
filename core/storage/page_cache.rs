@@ -208,6 +208,10 @@ impl DumbLruPageCache {
     pub fn len(&self) -> usize {
         self.map.borrow().len()
     }
+
+    pub fn make_room_for_one(&self) -> bool {
+        // XXX
+    }
 }
 
 #[cfg(test)]

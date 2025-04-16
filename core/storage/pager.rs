@@ -16,6 +16,13 @@ use tracing::trace;
 use super::page_cache::{DumbLruPageCache, PageCacheKey};
 use super::wal::{CheckpointMode, CheckpointStatus};
 
+#[macro_export]
+macro_rules! bail_page_cache_full {
+    () => {
+        return Err($crate::error::LimboError::PageCacheFull)
+    };
+}
+
 pub struct PageInner {
     pub flags: AtomicUsize,
     pub contents: Option<PageContent>,
@@ -302,6 +309,7 @@ impl Pager {
     }
 
     /// Reads a page from the database.
+    #[must_use]
     pub fn read_page(&self, page_idx: usize) -> Result<PageRef> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
@@ -309,6 +317,10 @@ impl Pager {
         if let Some(page) = page_cache.get(&page_key) {
             tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
             return Ok(page.clone());
+        }
+        if page_cache.is_full() {
+            tracing::warn!("Page cache is full when trying to read page {}", page_idx);
+            bail_page_cache_full!();
         }
         let page = Arc::new(Page::new(page_idx));
         page.set_locked();

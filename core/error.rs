@@ -51,6 +51,8 @@ pub enum LimboError {
     IntegerOverflow,
     #[error("Schema is locked for write")]
     SchemaLocked,
+    #[error("Page cache is full")]
+    PageCacheFull,
 }
 
 #[macro_export]
