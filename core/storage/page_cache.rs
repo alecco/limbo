@@ -360,13 +360,11 @@ impl DumbLruPageCache {
             }
         }
         println!("]");
-        // Verify map matches count
         if count != self.len() {
             println!("WARN: List count {} != Map length {}", count, self.len());
         }
     }
 
-    // Changed to &self, uses RefCell borrow
     pub fn len(&self) -> usize {
         self.map.borrow().len()
     }

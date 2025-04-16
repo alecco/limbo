@@ -16,6 +16,7 @@ use tracing::trace;
 use super::page_cache::{DumbLruPageCache, PageCacheKey};
 use super::wal::{CheckpointMode, CheckpointStatus};
 
+
 pub struct PageInner {
     pub flags: AtomicUsize,
     pub contents: Option<PageContent>,
@@ -302,6 +303,7 @@ impl Pager {
     }
 
     /// Reads a page from the database.
+    #[must_use]
     pub fn read_page(&self, page_idx: usize) -> Result<PageRef, LimboError> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
