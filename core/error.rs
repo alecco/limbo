@@ -55,10 +55,14 @@ pub enum LimboError {
     PageLocked,
     #[error("Page is dirty")]
     PageDirty,
-    #[error("Page has multiple references")]
-    PageHasMultipleRefs,
+    #[error("Page has active references")]
+    PageHasActiveRefs,
     #[error("Page cache is full")]
     PageCacheFull,
+    #[error("Page cache is empty")]
+    PageCacheEmpty,
+    #[error("Key does not exist in Page cache")]
+    PageCacheKeyNotFound,
 }
 
 #[macro_export]
