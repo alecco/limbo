@@ -14,7 +14,7 @@ use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::vdbe::BranchOffset;
-use crate::{bail_parse_error, Pager};
+use crate::{bail_parse_error, LimboError, Pager};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -119,7 +119,7 @@ fn update_pragma(
     header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
     program: &mut ProgramBuilder,
-) -> crate::Result<()> {
+) -> crate::Result<(), LimboError> {
     match pragma {
         PragmaName::CacheSize => {
             let cache_size = match value {
@@ -134,8 +134,7 @@ fn update_pragma(
                 },
                 _ => bail_parse_error!("Not a valid value"),
             };
-            update_cache_size(cache_size, header, pager);
-            Ok(())
+            update_cache_size(cache_size, header, pager)
         }
         PragmaName::JournalMode => {
             query_pragma(PragmaName::JournalMode, schema, None, header, program)?;
@@ -262,7 +261,8 @@ fn query_pragma(
     Ok(())
 }
 
-fn update_cache_size(value: i64, header: Arc<SpinLock<DatabaseHeader>>, pager: Rc<Pager>) {
+#[must_use]
+fn update_cache_size(value: i64, header: Arc<SpinLock<DatabaseHeader>>, pager: Rc<Pager>) -> Result<(), LimboError> {
     let mut cache_size_unformatted: i64 = value;
     let mut cache_size = if cache_size_unformatted < 0 {
         let kb = cache_size_unformatted.abs() * 1024;
@@ -287,5 +287,5 @@ fn update_cache_size(value: i64, header: Arc<SpinLock<DatabaseHeader>>, pager: R
     pager.write_database_header(&header_copy);
 
     // update cache size
-    pager.change_page_cache_size(cache_size);
+    pager.change_page_cache_size(cache_size)
 }

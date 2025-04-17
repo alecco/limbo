@@ -63,6 +63,10 @@ pub enum LimboError {
     PageCacheEmpty,
     #[error("Key does not exist in Page cache")]
     PageCacheKeyNotFound,
+    #[error("Key already exists in Page cache")]
+    PageCacheKeyExists,
+    #[error("Not enough space in Page cache")]
+    PageCacheNotEnoughSpace,
 }
 
 #[macro_export]

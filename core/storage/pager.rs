@@ -295,7 +295,7 @@ impl Pager {
     }
 
     /// Reads a page from the database.
-    pub fn read_page(&self, page_idx: usize) -> Result<PageRef> {
+    pub fn read_page(&self, page_idx: usize) -> Result<PageRef, LimboError> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
         let max_frame = match &self.wal {
@@ -303,10 +303,12 @@ impl Pager {
             None => 0,
         };
         let page_key = PageCacheKey::new(page_idx, Some(max_frame));
-        if let Some(page) = page_cache.get(&page_key) {
+        if let Ok(page) = page_cache.get(&page_key) {
             tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
             return Ok(page.clone());
         }
+        // New cache entry, make room first
+        page_cache.make_room_for(1)?;
         let page = Arc::new(Page::new(page_idx));
         page.set_locked();
 
@@ -317,10 +319,7 @@ impl Pager {
                 {
                     page.set_uptodate();
                 }
-                // TODO(pere) ensure page is inserted, we should probably first insert to page cache
-                // and if successful, read frame or page
-                page_cache.insert(page_key, page.clone());
-                return Ok(page);
+                return page_cache.insert(&page_key, page.clone());
             }
         }
         sqlite3_ondisk::begin_read_page(
@@ -329,9 +328,7 @@ impl Pager {
             page.clone(),
             page_idx,
         )?;
-        // TODO(pere) ensure page is inserted
-        page_cache.insert(page_key, page.clone());
-        Ok(page)
+        page_cache.insert(&page_key, page.clone())
     }
 
     /// Loads pages if not loaded
@@ -353,16 +350,18 @@ impl Pager {
                     page.set_uptodate();
                 }
                 // TODO(pere) ensure page is inserted
+                // XXX shouldn't the page ALWAYS have a reference from cache? so the following shouldn't be necessary, it's the same page just changed
                 if !page_cache.contains_key(&page_key) {
-                    page_cache.insert(page_key, page.clone());
+                    page_cache.insert(&page_key, page.clone())?;
                 }
                 return Ok(());
             }
         }
 
         // TODO(pere) ensure page is inserted
+        // XXX shouldn't the page ALWAYS have a reference from cache? so the following shouldn't be necessary, it's the same page just changed
         if !page_cache.contains_key(&page_key) {
-            page_cache.insert(page_key, page.clone());
+            page_cache.insert(&page_key, page.clone())?;
         }
         sqlite3_ondisk::begin_read_page(
             self.db_file.clone(),
@@ -380,9 +379,10 @@ impl Pager {
     }
 
     /// Changes the size of the page cache.
-    pub fn change_page_cache_size(&self, capacity: usize) {
+    #[must_use]
+    pub fn change_page_cache_size(&self, capacity: usize) -> Result<(), LimboError> {
         let mut page_cache = self.page_cache.write();
-        page_cache.resize(capacity);
+        page_cache.resize(capacity)
     }
 
     pub fn add_dirty(&self, page_id: usize) {
@@ -391,7 +391,8 @@ impl Pager {
         dirty_pages.insert(page_id);
     }
 
-    pub fn cacheflush(&self) -> Result<CheckpointStatus> {
+    #[must_use]
+    pub fn cacheflush(&self) -> Result<CheckpointStatus, LimboError> {
         let mut checkpoint_result = CheckpointResult::default();
         loop {
             let state = self.flush_info.borrow().state;
@@ -419,7 +420,7 @@ impl Pager {
                         // This page is no longer valid.
                         // For example:
                         // We took page with key (page_num, max_frame) -- this page is no longer valid for that max_frame so it must be invalidated.
-                        cache.delete(page_key);
+                        cache.delete(&page_key)?;
                     }
                     self.dirty_pages.borrow_mut().clear();
                     self.flush_info.borrow_mut().state = FlushState::WaitAppendFrames;
@@ -625,7 +626,7 @@ impl Pager {
         Currently free list pages are not yet supported.
     */
     #[allow(clippy::readonly_write_lock)]
-    pub fn allocate_page(&self) -> Result<PageRef> {
+    pub fn allocate_page(&self) -> Result<PageRef, LimboError> {
         let header = &self.db_header;
         let mut header = header.lock();
         header.database_size += 1;
@@ -651,7 +652,6 @@ impl Pager {
         {
             // setup page and add to cache
             page.set_dirty();
-            self.add_dirty(page.get().id);
             let mut cache = self.page_cache.write();
             let max_frame = match &self.wal {
                 Some(wal) => wal.borrow().get_max_frame(),
@@ -659,21 +659,21 @@ impl Pager {
             };
 
             let page_key = PageCacheKey::new(page.get().id, Some(max_frame));
-            cache.insert(page_key, page.clone());
+            cache.insert(&page_key, page.clone())  // NOTE: Fails if key already exists
         }
-        Ok(page)
     }
 
-    pub fn put_loaded_page(&self, id: usize, page: PageRef) {
+    #[must_use]
+    pub fn put_loaded_page(&self, id: usize, page: PageRef) -> Result<(), LimboError> {
         let mut cache = self.page_cache.write();
-        // cache insert invalidates previous page
         let max_frame = match &self.wal {
             Some(wal) => wal.borrow().get_max_frame(),
             None => 0,
         };
         let page_key = PageCacheKey::new(id, Some(max_frame));
-        cache.insert(page_key, page.clone());
+        cache.insert_with_replace(&page_key, page.clone())?;
         page.set_loaded();
+        Ok(())
     }
 
     pub fn usable_size(&self) -> usize {
@@ -744,11 +744,12 @@ mod tests {
             std::thread::spawn(move || {
                 let mut cache = cache.write();
                 let page_key = PageCacheKey::new(1, None);
-                cache.insert(page_key, Arc::new(Page::new(1)));
+                let result = cache.insert(&page_key, Arc::new(Page::new(1)));
+                assert!(result.is_ok(), "Failed to insert page: {:?}", result.err());
             })
         };
         let _ = thread.join();
-        let mut cache = cache.write();
+        let cache = cache.write();
         let page_key = PageCacheKey::new(1, None);
         let page = cache.get(&page_key);
         assert_eq!(page.unwrap().get().id, 1);

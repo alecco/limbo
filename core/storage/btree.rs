@@ -1563,7 +1563,8 @@ impl BTreeCursor {
     }
 
     /// Balance a non root page by trying to balance cells between a maximum of 3 siblings that should be neighboring the page that overflowed/underflowed.
-    fn balance_non_root(&mut self) -> Result<CursorResult<()>> {
+    #[must_use]
+    fn balance_non_root(&mut self) -> Result<CursorResult<()>, LimboError> {
         assert!(
             matches!(self.state, CursorState::Write(_)),
             "Cursor must be in balancing state"
@@ -2106,7 +2107,7 @@ impl BTreeCursor {
                 for (page, new_id) in pages_to_balance_new.iter().zip(page_numbers) {
                     if new_id != page.get().id {
                         page.get().id = new_id;
-                        self.pager.put_loaded_page(new_id, page.clone());
+                        self.pager.put_loaded_page(new_id, page.clone())?;
                     }
                 }
 
