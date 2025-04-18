@@ -32,6 +32,8 @@ pub struct DumbLruPageCache {
     head: RefCell<Option<NonNull<PageCacheEntry>>>,
     tail: RefCell<Option<NonNull<PageCacheEntry>>>,
 }
+
+// XXX Send/Sync impls - RefCell makes this !Sync
 unsafe impl Send for DumbLruPageCache {}
 unsafe impl Sync for DumbLruPageCache {}
 
