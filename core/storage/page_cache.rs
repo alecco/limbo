@@ -228,11 +228,12 @@ impl DumbLruPageCache {
             return Err(CacheError::Full);
         }
 
-        let available = self.capacity.saturating_sub(self.len());
-        if n <= available {
+        let len = self.len();
+        let available = self.capacity.saturating_sub(len);
+        if n <= available && len <= self.capacity {
             return Ok(());
         }
-        let mut need_to_evict = n - available;
+
         let tail = self.tail.borrow().ok_or_else(|| {
             CacheError::InternalError(format!(
                 "Page cache of len {} expected to have a tail pointer",
@@ -240,15 +241,20 @@ impl DumbLruPageCache {
             ))
         })?;
 
+        // Handle len > capacity, too
+        let available = self.capacity.saturating_sub(len);
+        let x = n.saturating_sub(available);
+        let mut need_to_evict = x.saturating_add(len.saturating_sub(self.capacity));
+
         let mut current_opt = Some(tail);
         while need_to_evict > 0 && current_opt.is_some() {
             let current = current_opt.unwrap();
             let entry = unsafe { current.as_ref() };
+            current_opt = entry.prev; // Pick prev before modifying entry
             match self.delete(entry.key.clone()) {
                 Err(_) => {}
                 Ok(_) => need_to_evict -= 1,
             }
-            current_opt = entry.prev;
         }
 
         match need_to_evict > 0 {
