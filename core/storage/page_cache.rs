@@ -426,7 +426,7 @@ mod tests {
         PageCacheKey::new(id, Some(id as u64))
     }
 
-    pub fn page_with_content(page_id: usize) -> PageRef {
+    fn page_with_content(page_id: usize) -> PageRef {
         let page = Arc::new(Page::new(page_id));
         {
             let buffer_drop_fn = Rc::new(|_data: BufferData| {});

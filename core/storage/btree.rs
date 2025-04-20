@@ -2383,10 +2383,12 @@ impl BTreeCursor {
                 for (page, new_id) in pages_to_balance_new.iter().zip(page_numbers) {
                     if new_id != page.get().id {
                         page.get().id = new_id;
-                        self.pager.put_loaded_page(new_id, page.clone());
+                        // FIXME: why would there be another page at this id/frame?
+                        self.pager
+                            .put_loaded_page(new_id, page.clone())
+                            .expect("put_loaded_page should not fail here");
                     }
                 }
-
                 #[cfg(debug_assertions)]
                 {
                     tracing::debug!("balance_non_root(parent page_id={})", parent_page.get().id);
@@ -5198,7 +5200,8 @@ mod tests {
                 payload_overflow_threshold_min,
             },
             pager::PageRef,
-            sqlite3_ondisk::{BTreeCell, PageContent, PageType},
+            sqlite3_ondisk::{BTreeCell, PageContent, PageType}, // XXX
+            pager::tests::{create_test_pager, run_pager_io}, // cache_flush, 
         },
         types::OwnedValue,
         Database, Page, Pager, PlatformIO,
@@ -5479,7 +5482,7 @@ mod tests {
         }
     }
 
-    fn empty_btree() -> (Rc<Pager>, usize) {
+    fn empty_btree(cache_size: usize) -> (Rc<Pager>, usize) {
         let db_header = DatabaseHeader::default();
         let page_size = db_header.page_size as usize;
 
@@ -5493,17 +5496,23 @@ mod tests {
         let wal_file = WalFile::new(io.clone(), page_size, wal_shared, buffer_pool.clone());
         let wal = Rc::new(RefCell::new(wal_file));
 
-        let page_cache = Arc::new(parking_lot::RwLock::new(DumbLruPageCache::new(10)));
+        let page_cache = Arc::new(parking_lot::RwLock::new(DumbLruPageCache::new(cache_size)));
         let pager = {
             let db_header = Arc::new(SpinLock::new(db_header.clone()));
             Pager::finish_open(db_header, db_file, Some(wal), io, page_cache, buffer_pool).unwrap()
         };
         let pager = Rc::new(pager);
-        // FIXME: handle page cache is full
-        let page1 = pager.allocate_page().unwrap();
-        btree_init_page(&page1, PageType::TableLeaf, 0, 4096);
-        (pager, page1.get().id)
+        let page = pager.allocate_page().unwrap();
+        btree_init_page(&page, PageType::TableLeaf, 0, 4096);
+        (pager, page.get().id)
     }
+    // fn empty_btree() -> (Rc<Pager>, usize) {
+    //     let (pager, data_page_id) = create_test_pager();
+    //     let pager = create_test_pager(); // Use the helper from pager::tests
+    //     let root_page_id = 1;
+    //     run_pager_io(&pager);
+    //     (pager, page1.get().id)
+    // }
 
     #[test]
     #[ignore]
@@ -5552,7 +5561,7 @@ mod tests {
             ]
             .as_slice(),
         ] {
-            let (pager, root_page) = empty_btree();
+            let (pager, root_page) = empty_btree(10);
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
             for (key, size) in sequence.iter() {
                 run_until_done(
@@ -5609,7 +5618,7 @@ mod tests {
         let mut seen = HashSet::new();
         tracing::info!("super seed: {}", seed);
         for _ in 0..attempts {
-            let (pager, root_page) = empty_btree();
+            let (pager, root_page) = empty_btree(1000000);  // XXX set up proper somehow
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
             let mut keys = Vec::new();
             tracing::info!("seed: {}", seed);
@@ -6646,7 +6655,7 @@ mod tests {
 
     #[test]
     pub fn btree_insert_sequential() {
-        let (pager, root_page) = empty_btree();
+        let (pager, root_page) = empty_btree(11000);
         let mut keys = Vec::new();
         for i in 0..10000 {
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
@@ -6725,7 +6734,7 @@ mod tests {
         // 3. Verify validity/integrity of btree after deleting and also verify that these
         //    values are actually deleted.
 
-        let (pager, root_page) = empty_btree();
+        let (pager, root_page) = create_test_pager(11000); // XXX
 
         // Insert 10,000 records in to the BTree.
         for i in 1..=10000 {
@@ -6737,7 +6746,7 @@ mod tests {
             run_until_done(
                 || {
                     let key = SeekKey::TableRowId(i as u64);
-                    cursor.move_to(key, SeekOp::EQ)
+                    cursor.move_to(key, SeekOp::EQ) // XXX fails
                 },
                 pager.deref(),
             )
@@ -6801,7 +6810,7 @@ mod tests {
             huge_texts.push(huge_text);
         }
 
-        let (pager, root_page) = empty_btree();
+        let (pager, root_page) = empty_btree(100);
 
         for i in 0..iterations {
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);

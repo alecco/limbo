@@ -306,7 +306,7 @@ impl Pager {
     }
 
     /// Reads a page from the database.
-    pub fn read_page(&self, page_idx: usize) -> Result<PageRef> {
+    pub fn read_page(&self, page_idx: usize) -> Result<PageRef, LimboError> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
         let max_frame = match &self.wal {
@@ -328,9 +328,21 @@ impl Pager {
                 {
                     page.set_uptodate();
                 }
-                // TODO(pere) ensure page is inserted, we should probably first insert to page cache
-                // and if successful, read frame or page
-                page_cache.insert(page_key, page.clone());
+                // TODO(pere) should probably first insert to page cache, and if successful,
+                // read frame or page
+                match page_cache.insert(page_key, page.clone()) {
+                    Ok(_) => {}
+                    Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                    Err(CacheError::KeyExists) => {
+                        unreachable!("Page should not exist in cache after get() miss")
+                    }
+                    Err(e) => {
+                        return Err(LimboError::InternalError(format!(
+                            "Failed to insert page into cache: {:?}",
+                            e
+                        )))
+                    }
+                }
                 return Ok(page);
             }
         }
@@ -340,8 +352,19 @@ impl Pager {
             page.clone(),
             page_idx,
         )?;
-        // TODO(pere) ensure page is inserted
-        page_cache.insert(page_key, page.clone());
+        match page_cache.insert(page_key, page.clone()) {
+            Ok(_) => {}
+            Err(CacheError::Full) => return Err(LimboError::CacheFull),
+            Err(CacheError::KeyExists) => {
+                unreachable!("Page should not exist in cache after get() miss")
+            }
+            Err(e) => {
+                return Err(LimboError::InternalError(format!(
+                    "Failed to insert page into cache: {:?}",
+                    e
+                )))
+            }
+        }
         Ok(page)
     }
 
@@ -363,18 +386,33 @@ impl Pager {
                 {
                     page.set_uptodate();
                 }
-                // TODO(pere) ensure page is inserted
-                if !page_cache.contains_key(&page_key) {
-                    page_cache.insert(page_key, page.clone());
+                match page_cache.insert(page_key, page.clone()) {
+                    Err(CacheError::KeyExists) => {} // Exists but same page, not error
+                    Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                    Err(e) => {
+                        return Err(LimboError::InternalError(format!(
+                            "Failed to insert page into cache during load: {:?}",
+                            e
+                        )))
+                    }
+                    Ok(_) => {}
                 }
                 return Ok(());
             }
         }
 
-        // TODO(pere) ensure page is inserted
-        if !page_cache.contains_key(&page_key) {
-            page_cache.insert(page_key, page.clone());
-        }
+        match page_cache.insert(page_key, page.clone()) {
+            Err(CacheError::KeyExists) => {} // Ensures same page
+            Err(CacheError::Full) => return Err(LimboError::CacheFull),
+            Err(e) => {
+                return Err(LimboError::InternalError(format!(
+                    "Failed to insert page into cache during load: {:?}",
+                    e
+                )))
+            }
+            Ok(_) => {}
+        };
+
         sqlite3_ondisk::begin_read_page(
             self.db_file.clone(),
             self.buffer_pool.clone(),
@@ -394,7 +432,7 @@ impl Pager {
     // FIXME: handle no room in page cache
     pub fn change_page_cache_size(&self, capacity: usize) {
         let mut page_cache = self.page_cache.write();
-        page_cache.resize(capacity);
+        page_cache.resize(capacity)
     }
 
     pub fn add_dirty(&self, page_id: usize) {
@@ -430,8 +468,9 @@ impl Pager {
                         }
                         // This page is no longer valid.
                         // For example:
-                        // We took page with key (page_num, max_frame) -- this page is no longer valid for that max_frame so it must be invalidated.
-                        cache.delete(page_key);
+                        // We took page with key (page_num, max_frame) -- this page is no longer valid for that max_frame
+                        // so it must be invalidated. There shouldn't be any active refs.
+                        cache.delete(page_key).map_err(|e| {LimboError::InternalError(format!("Failed to delete page {:?} from cache during flush: {:?}. Might be actively referenced.", page_id, e))})?;
                     }
                     self.dirty_pages.borrow_mut().clear();
                     self.flush_info.borrow_mut().state = FlushState::WaitAppendFrames;
@@ -556,7 +595,10 @@ impl Pager {
             }
         }
         // TODO: only clear cache of things that are really invalidated
-        self.page_cache.write().clear();
+        self.page_cache
+            .write()
+            .clear()
+            .expect("Failed to clear page cache");
         checkpoint_result
     }
 
@@ -685,16 +727,36 @@ impl Pager {
         }
     }
 
-    pub fn put_loaded_page(&self, id: usize, page: PageRef) {
+    pub fn put_loaded_page(&self, id: usize, page: PageRef) -> Result<(), LimboError> {
         let mut cache = self.page_cache.write();
-        // cache insert invalidates previous page
         let max_frame = match &self.wal {
             Some(wal) => wal.borrow().get_max_frame(),
             None => 0,
         };
         let page_key = PageCacheKey::new(id, Some(max_frame));
-        cache.insert(page_key, page.clone());
+
+        // FIXME: is this correct? Why would there be another version of the page?
+        // Check if there's an existing page at this key and remove it
+        // This can happen when a page is being updated during a transaction
+        // or when WAL frames are being managed
+        if let Some(_existing_page_ref) = cache.get(&page_key) {
+            cache.delete(page_key.clone()).map_err(|e| {
+                LimboError::InternalError(format!(
+                    "put_loaded_page failed to remove old version of page {:?}: {:?}.",
+                    page_key, e
+                ))
+            })?;
+        }
+
+        cache.insert(page_key, page.clone()).map_err(|e| {
+            LimboError::InternalError(format!(
+                "Failed to insert loaded page {} into cache: {:?}",
+                id, e
+            ))
+        })?;
+
         page.set_loaded();
+        Ok(())
     }
 
     pub fn usable_size(&self) -> usize {
@@ -746,32 +808,278 @@ impl CreateBTreeFlags {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
+    use crate::io::{MemoryIO, OpenFlags, IO};
+    use crate::storage::database::DatabaseFile;
+    use crate::storage::page_cache::DumbLruPageCache;
+    use crate::storage::page_cache::PageCacheKey;
+    use crate::storage::sqlite3_ondisk;
+    use crate::storage::sqlite3_ondisk::PageType;
+    use crate::storage::wal::CheckpointStatus;
+    use crate::storage::wal::{WalFile, WalFileShared};
+    use crate::{btree_init_page, BufferPool, DatabaseHeader, Page, Pager, SpinLock};
+    use parking_lot::RwLock;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::Arc;
 
-    use parking_lot::RwLock;
+    pub(crate) fn run_pager_io(pager: &Pager) {
+        for _ in 0..9 {
+            let _ = pager.io.run_once();
+        }
+    }
 
-    use crate::storage::page_cache::{DumbLruPageCache, PageCacheKey};
 
-    use super::Page;
+    pub(crate) const SQLITE_ROOT_PAGE_ID: usize = 1;
 
+    pub(crate) fn create_test_pager(cache_size: usize) -> (Rc<Pager>, usize) {
+        let db_header = DatabaseHeader::default();
+        let page_size = db_header.page_size as usize;
+        let db_header_arc = Arc::new(SpinLock::new(db_header.clone()));
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let io_file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
+        let db_file = Arc::new(DatabaseFile::new(io_file));
+
+        let buffer_pool = Rc::new(BufferPool::new(page_size));
+        let wal_shared = WalFileShared::open_shared(&io, "test.wal", page_size as u16).unwrap();
+        let wal_file = WalFile::new(io.clone(), page_size, wal_shared, buffer_pool.clone());
+        let wal = Rc::new(RefCell::new(wal_file));
+
+        // XXX let page_cache = Arc::new(RwLock::new(DumbLruPageCache::new(cache_size)));
+        let page_cache = Arc::new(parking_lot::RwLock::new(DumbLruPageCache::new(cache_size)));
+        let pager = Pager::finish_open(
+            db_header_arc,
+            db_file,
+            Some(wal),
+            io,
+            page_cache,
+            buffer_pool,
+        )
+        .unwrap();
+        let pager = Rc::new(pager);
+
+        let root_page_ref = pager.read_page(SQLITE_ROOT_PAGE_ID).unwrap();
+        root_page_ref.get_contents()
+            .write_database_header(&pager.db_header.lock());
+        root_page_ref.set_dirty();
+        pager.add_dirty(root_page_ref.get().id);
+        drop(root_page_ref);
+
+        let page_ref = pager.allocate_page().unwrap();
+        let page_id = page_ref.get().id;
+        btree_init_page(&page_ref, PageType::TableLeaf, 0, 4096);
+        pager.add_dirty(page_id);
+        drop(page_ref);
+
+        cache_flush(&pager);
+
+        (pager, page_id)
+    }
+
+    pub fn cache_flush(pager: &Rc<Pager>) -> CheckpointStatus {
+        const FLUSH_IO_LIMIT: usize = 10;
+
+        let mut status = pager.cacheflush().unwrap();
+        let mut io_count = 0;
+        while matches!(status, CheckpointStatus::IO) {
+            io_count += 1;
+            assert!(
+                io_count <= FLUSH_IO_LIMIT,
+                "Too many IO iterations ({}), maximum allowed is {}",
+                io_count,
+                FLUSH_IO_LIMIT
+            );
+            run_pager_io(&pager);
+            status = pager.cacheflush().unwrap();
+        }
+        status
+    }
+
+    // TODO: move to page_cache.rs
+    // Ensure cache can be shared between threads
     #[test]
     fn test_shared_cache() {
-        // ensure cache can be shared between threads
         let cache = Arc::new(RwLock::new(DumbLruPageCache::new(10)));
 
         let thread = {
             let cache = cache.clone();
             std::thread::spawn(move || {
                 let mut cache = cache.write();
-                let page_key = PageCacheKey::new(1, None);
-                cache.insert(page_key, Arc::new(Page::new(1)));
+                let key1 = PageCacheKey::new(1, None);
+                assert!(cache.insert(key1, Arc::new(Page::new(1))).is_ok());
             })
         };
+
         let _ = thread.join();
         let mut cache = cache.write();
-        let page_key = PageCacheKey::new(1, None);
-        let page = cache.get(&page_key);
-        assert_eq!(page.unwrap().get().id, 1);
+        let key1 = PageCacheKey::new(1, None);
+        let key2 = PageCacheKey::new(2, None);
+        assert!(cache.insert(key2.clone(), Arc::new(Page::new(2))).is_ok());
+
+        let page_ref1 = cache.get(&key1).expect("Page 1 should be in cache");
+        assert_eq!(page_ref1.get().id, 1);
+        let page_ref2 = cache.get(&key2).expect("Page 2 should be in cache");
+        assert_eq!(page_ref2.get().id, 2);
+    }
+
+    #[test]
+    fn test_read_page_simple() {
+        let (pager, data_page_id) = create_test_pager(10);
+        let page_ref = pager.read_page(data_page_id).unwrap();
+        run_pager_io(&pager);
+        assert_eq!(page_ref.get().id, data_page_id);
+        assert!(page_ref.is_loaded(), "Page should be loaded");
+        assert!(
+            !page_ref.is_locked(),
+            "Page should not be locked after read"
+        );
+    }
+
+    #[test]
+    fn test_read_page_cached() {
+        let (pager, data_page_id) = create_test_pager(10);
+        let page_ref_first = pager.read_page(data_page_id).unwrap();
+        run_pager_io(&pager);
+        assert!(page_ref_first.is_loaded());
+        let page_ref_second = pager.read_page(data_page_id).unwrap();
+        run_pager_io(&pager);
+        assert!(
+            Arc::ptr_eq(&page_ref_first, &page_ref_second),
+            "Should get the same PageRef from cache"
+        );
+        assert!(page_ref_second.is_loaded(), "Cached page should be loaded");
+    }
+
+    #[test]
+    fn test_read_page_wal() {
+        let (pager, data_page_id) = create_test_pager(10);
+        let wal = pager.wal.as_ref().unwrap();
+
+        let page_ref = pager.read_page(data_page_id).unwrap();
+        run_pager_io(&pager);
+        page_ref.set_dirty();
+        pager.add_dirty(data_page_id);
+        drop(page_ref);
+        let first_frame = wal.borrow().get_max_frame_in_wal();
+
+        cache_flush(&pager);
+        let page_ref_wal = pager.read_page(data_page_id).unwrap();
+        assert!(
+            page_ref_wal.is_loaded(),
+            "Page read from WAL should be loaded"
+        );
+        assert!(
+            page_ref_wal.is_uptodate(),
+            "Page read from WAL should be up-to-date"
+        );
+        assert_eq!(
+            wal.borrow().get_max_frame_in_wal(),
+            first_frame + 1,
+            "WAL should have one frame"
+        );
+    }
+
+    #[test]
+    fn test_load_page_not_loaded() {
+        let (pager, _) = create_test_pager(10);
+        let page_ref = pager.allocate_page().unwrap();
+        assert!(
+            page_ref.is_loaded(),
+            "Page allocated should initially be marked loaded"
+        );
+        assert!(pager.load_page(page_ref.clone()).is_ok());
+        run_pager_io(&pager);
+        assert!(
+            page_ref.is_loaded(),
+            "Page should remain loaded after load_page call"
+        );
+    }
+
+    #[test]
+    fn test_cacheflush_dirty_page() {
+        const POS: usize = 1;
+        const VAL: u32 = 1234;
+        let (pager, data_page_id) = create_test_pager(10);
+
+        let page_ref = pager.read_page(data_page_id).unwrap();
+        run_pager_io(&pager);
+        {
+            let contents = page_ref.get_contents();
+            contents.write_u32(POS, VAL);
+        }
+        page_ref.set_dirty();
+        pager.add_dirty(data_page_id);
+        assert_eq!(pager.dirty_pages.borrow().len(), 1);
+        let first_frame = pager.wal.as_ref().unwrap().borrow().get_max_frame_in_wal();
+        drop(page_ref);
+
+        cache_flush(&pager);
+        assert_eq!(
+            pager.dirty_pages.borrow().len(),
+            0,
+            "Dirty pages should be cleared after flush"
+        );
+        assert_eq!(
+            pager.wal.as_ref().unwrap().borrow().get_max_frame_in_wal(),
+            first_frame + 1,
+            "WAL frame count should increase"
+        );
+        let page_ref_after = pager.read_page(data_page_id).unwrap();
+        run_pager_io(&pager);
+        assert!(
+            !page_ref_after.is_dirty(),
+            "Page should not be dirty after flush"
+        );
+        assert!(page_ref_after.is_loaded());
+        {
+            let contents = page_ref_after.get_contents();
+            assert_eq!(
+                contents.read_u32(POS),
+                VAL,
+                "Read back page should have modified user_version"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cacheflush_no_dirty_pages() {
+        let (pager, _) = create_test_pager(10);
+        let initial_dirty_pages = pager.dirty_pages.borrow().len();
+        let initial_max_frame = pager.wal.as_ref().unwrap().borrow().get_max_frame();
+        let status = cache_flush(&pager);
+        assert!(
+            matches!(status, CheckpointStatus::Done(_)),
+            "Flush should eventually complete with Done status"
+        );
+        assert_eq!(
+            pager.dirty_pages.borrow().len(),
+            initial_dirty_pages,
+            "Dirty pages should remain empty"
+        );
+        assert_eq!(
+            pager.wal.as_ref().unwrap().borrow().get_max_frame(),
+            initial_max_frame,
+            "WAL frame count should not change"
+        );
+    }
+
+    #[test]
+    fn test_allocate_page() {
+        let (pager, data_page_id) = create_test_pager(10);
+
+        let page_ref = pager.allocate_page().unwrap();
+        run_pager_io(&pager);
+        let page_id = data_page_id + 1;
+        assert_eq!(page_ref.get().id, page_id);
+        assert!(page_ref.is_loaded());
+        assert!(page_ref.is_dirty());
+        assert!(pager.dirty_pages.borrow().contains(&page_id));
+        assert_eq!(
+            pager.db_header.lock().database_size,
+            3,
+            "Database size should increase"
+        );
     }
 }
