@@ -5201,7 +5201,7 @@ mod tests {
             },
             pager::PageRef,
             sqlite3_ondisk::{BTreeCell, PageContent, PageType}, // XXX
-            pager::tests::{create_test_pager, run_pager_io}, // cache_flush, 
+            pager::tests::{create_test_pager}, // cache_flush, run_pager_io, 
         },
         types::OwnedValue,
         Database, Page, Pager, PlatformIO,
@@ -5275,6 +5275,15 @@ mod tests {
         insert_into_cell(page, &payload, pos, 4096).unwrap();
         payload
     }
+
+    // XXX failing tests
+    // XXX btree_insert_fuzz_run_equal_size
+    // XXX test_drop_page_in_balancing_issue_1203_2
+    // XXX btree_insert_fuzz_run_overflow
+    // XXX test_drop_page_in_balancing_issue_1203
+    // XXX btree_insert_fuzz_run_random
+    // XXX btree_insert_fuzz_run_big
+    // XXX test_delete_balancing
 
     #[test]
     fn test_insert_cell() {
@@ -5482,38 +5491,6 @@ mod tests {
         }
     }
 
-    fn empty_btree(cache_size: usize) -> (Rc<Pager>, usize) {
-        let db_header = DatabaseHeader::default();
-        let page_size = db_header.page_size as usize;
-
-        #[allow(clippy::arc_with_non_send_sync)]
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let io_file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
-        let db_file = Arc::new(DatabaseFile::new(io_file));
-
-        let buffer_pool = Rc::new(BufferPool::new(db_header.page_size as usize));
-        let wal_shared = WalFileShared::open_shared(&io, "test.wal", db_header.page_size).unwrap();
-        let wal_file = WalFile::new(io.clone(), page_size, wal_shared, buffer_pool.clone());
-        let wal = Rc::new(RefCell::new(wal_file));
-
-        let page_cache = Arc::new(parking_lot::RwLock::new(DumbLruPageCache::new(cache_size)));
-        let pager = {
-            let db_header = Arc::new(SpinLock::new(db_header.clone()));
-            Pager::finish_open(db_header, db_file, Some(wal), io, page_cache, buffer_pool).unwrap()
-        };
-        let pager = Rc::new(pager);
-        let page = pager.allocate_page().unwrap();
-        btree_init_page(&page, PageType::TableLeaf, 0, 4096);
-        (pager, page.get().id)
-    }
-    // fn empty_btree() -> (Rc<Pager>, usize) {
-    //     let (pager, data_page_id) = create_test_pager();
-    //     let pager = create_test_pager(); // Use the helper from pager::tests
-    //     let root_page_id = 1;
-    //     run_pager_io(&pager);
-    //     (pager, page1.get().id)
-    // }
-
     #[test]
     #[ignore]
     pub fn btree_insert_fuzz_ex() {
@@ -5561,7 +5538,7 @@ mod tests {
             ]
             .as_slice(),
         ] {
-            let (pager, root_page) = empty_btree(10);
+            let (pager, root_page) = create_test_pager(10);
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
             for (key, size) in sequence.iter() {
                 run_until_done(
@@ -5618,7 +5595,7 @@ mod tests {
         let mut seen = HashSet::new();
         tracing::info!("super seed: {}", seed);
         for _ in 0..attempts {
-            let (pager, root_page) = empty_btree(1000000);  // XXX set up proper somehow
+            let (pager, root_page) = create_test_pager(10000000);  // XXX set up proper somehow
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
             let mut keys = Vec::new();
             tracing::info!("seed: {}", seed);
@@ -6655,7 +6632,7 @@ mod tests {
 
     #[test]
     pub fn btree_insert_sequential() {
-        let (pager, root_page) = empty_btree(11000);
+        let (pager, root_page) = create_test_pager(11000);
         let mut keys = Vec::new();
         for i in 0..10000 {
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
@@ -6733,11 +6710,13 @@ mod tests {
         //    (verified this in SQLite).
         // 3. Verify validity/integrity of btree after deleting and also verify that these
         //    values are actually deleted.
+        const CACHE_SIZE: usize = 12000;
+        const RECORDS: usize = 10000;
 
-        let (pager, root_page) = create_test_pager(11000); // XXX
+        let (pager, root_page) = create_test_pager(CACHE_SIZE);
 
         // Insert 10,000 records in to the BTree.
-        for i in 1..=10000 {
+        for i in 1..=RECORDS {
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
             let value = ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Text(
                 Text::new("hello world"),
@@ -6810,7 +6789,7 @@ mod tests {
             huge_texts.push(huge_text);
         }
 
-        let (pager, root_page) = empty_btree(100);
+        let (pager, root_page) = create_test_pager(100);
 
         for i in 0..iterations {
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);

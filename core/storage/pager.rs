@@ -813,7 +813,6 @@ pub mod tests {
     use crate::storage::database::DatabaseFile;
     use crate::storage::page_cache::DumbLruPageCache;
     use crate::storage::page_cache::PageCacheKey;
-    use crate::storage::sqlite3_ondisk;
     use crate::storage::sqlite3_ondisk::PageType;
     use crate::storage::wal::CheckpointStatus;
     use crate::storage::wal::{WalFile, WalFileShared};
@@ -874,6 +873,7 @@ pub mod tests {
         drop(page_ref);
 
         cache_flush(&pager);
+        run_pager_io(&pager);
 
         (pager, page_id)
     }
