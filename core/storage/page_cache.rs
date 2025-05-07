@@ -48,7 +48,7 @@ pub enum CacheError {
     Dirty,
     ActiveRefs,
     Full,
-    KeyExists,
+    KeyExists(String),
 }
 
 impl PageCacheKey {
@@ -72,13 +72,12 @@ impl DumbLruPageCache {
 
     pub fn insert(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
         trace!("insert(key={:?})", key);
-        // Check first if page already exists in cache
         if let Some(existing_page_ref) = self.get(&key) {
-            assert!(
-                Arc::ptr_eq(&value, &existing_page_ref),
-                "Attempted to insert different page with same key"
-            );
-            return Err(CacheError::KeyExists);
+            if Arc::ptr_eq(&value, &existing_page_ref) {
+                return Ok(());
+            } else {
+                return Err(CacheError::KeyExists(format!("Can't insert a new page in cache for key {:?} because a different page with that key already exists", key)));
+            }
         }
         self.make_room_for(1)?;
         let entry = Box::new(PageCacheEntry {
